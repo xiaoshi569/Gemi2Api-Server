@@ -5,13 +5,14 @@ import os
 import base64
 import re
 import tempfile
+import random
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 import time
 import uuid
 import logging
@@ -35,32 +36,79 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
-# Global client
+# Global client and credential management
 gemini_client = None
+credential_index = -1  # 设置为-1，确保第一次调用get_next_credentials时返回索引0
+failed_credentials = set()
 
 # Authentication credentials
-SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
-SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
+# Format for multiple credentials: "cred1|cred2|cred3"
+SECURE_1PSID_LIST = os.environ.get("SECURE_1PSID", "").split("|")
+SECURE_1PSIDTS_LIST = os.environ.get("SECURE_1PSIDTS", "").split("|")
 API_KEY = os.environ.get("API_KEY", "")
 
 # Print debug info at startup
-if not SECURE_1PSID or not SECURE_1PSIDTS:
+if not SECURE_1PSID_LIST or not SECURE_1PSID_LIST[0]:
 	logger.warning("⚠️ Gemini API credentials are not set or empty! Please check your environment variables.")
 	logger.warning("Make sure SECURE_1PSID and SECURE_1PSIDTS are correctly set in your .env file or environment.")
-	logger.warning("If using Docker, ensure the .env file is correctly mounted and formatted.")
+	logger.warning("For multiple credentials, use pipe (|) as separator: cred1|cred2|cred3")
 	logger.warning("Example format in .env file (no quotes):")
-	logger.warning("SECURE_1PSID=your_secure_1psid_value_here")
-	logger.warning("SECURE_1PSIDTS=your_secure_1psidts_value_here")
+	logger.warning("SECURE_1PSID=your_secure_1psid_value_here|another_1psid_value")
+	logger.warning("SECURE_1PSIDTS=your_secure_1psidts_value_here|another_1psidts_value")
 else:
-	# Only log the first few characters for security
-	logger.info(f"Credentials found. SECURE_1PSID starts with: {SECURE_1PSID[:5]}...")
-	logger.info(f"Credentials found. SECURE_1PSIDTS starts with: {SECURE_1PSIDTS[:5]}...")
+	logger.info(f"Found {len(SECURE_1PSID_LIST)} credential pairs.")
+	for i in range(len(SECURE_1PSID_LIST)):
+		# 只显示PSID的前几个字符，但显示完整的PSIDTS（它更短且更容易区分）
+		logger.info(f"Credential pair {i}: SECURE_1PSID starts with {SECURE_1PSID_LIST[i][:5]}..., SECURE_1PSIDTS: {SECURE_1PSIDTS_LIST[i]}")
+	
+	# Ensure the two credential lists have the same length
+	if len(SECURE_1PSID_LIST) != len(SECURE_1PSIDTS_LIST):
+		logger.warning("⚠️ The number of SECURE_1PSID and SECURE_1PSIDTS credentials don't match!")
+		# Trim to the shorter list
+		min_length = min(len(SECURE_1PSID_LIST), len(SECURE_1PSIDTS_LIST))
+		SECURE_1PSID_LIST = SECURE_1PSID_LIST[:min_length]
+		SECURE_1PSIDTS_LIST = SECURE_1PSIDTS_LIST[:min_length]
+		logger.warning(f"Using only the first {min_length} credential pairs.")
 
 if not API_KEY:
 	logger.warning("⚠️ API_KEY is not set or empty! API authentication will not work.")
 	logger.warning("Make sure API_KEY is correctly set in your .env file or environment.")
 else:
 	logger.info(f"API_KEY found. API_KEY starts with: {API_KEY[:5]}...")
+
+# Credential rotation lock to prevent race conditions
+credential_lock = asyncio.Lock()
+
+async def get_next_credentials() -> Tuple[str, str]:
+	"""Get the next valid credential pair using round-robin approach with failure tracking"""
+	global credential_index, failed_credentials
+	
+	async with credential_lock:
+		if not SECURE_1PSID_LIST or not SECURE_1PSID_LIST[0]:
+			return "", ""
+			
+		# If all credentials have failed, reset and try again
+		if len(failed_credentials) >= len(SECURE_1PSID_LIST):
+			logger.warning("All credentials have failed. Resetting failed tracking and trying again.")
+			failed_credentials = set()
+		
+		# Find a credential that hasn't failed
+		for _ in range(len(SECURE_1PSID_LIST)):
+			credential_index = (credential_index + 1) % len(SECURE_1PSID_LIST)
+			if credential_index not in failed_credentials:
+				logger.info(f"Selected credential pair {credential_index} for use")
+				return SECURE_1PSID_LIST[credential_index], SECURE_1PSIDTS_LIST[credential_index]
+		
+		# If we get here, all credentials have failed
+		return "", ""
+
+async def mark_credential_failed(index: int):
+	"""Mark a credential as failed"""
+	global failed_credentials
+	
+	async with credential_lock:
+		failed_credentials.add(index)
+		logger.warning(f"Marked credential pair {index} as failed. Total failed: {len(failed_credentials)}/{len(SECURE_1PSID_LIST)}")
 
 
 def correct_markdown(md_text: str) -> str:
@@ -289,26 +337,70 @@ def prepare_conversation(messages: List[Message]) -> tuple:
 
 # Dependency to get the initialized Gemini client
 async def get_gemini_client():
-	global gemini_client
+	global gemini_client, credential_index
+	
 	if gemini_client is None:
 		try:
-			gemini_client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
+			# Get the first set of credentials
+			secure_1psid, secure_1psidts = await get_next_credentials()
+			if not secure_1psid or not secure_1psidts:
+				logger.error("No valid credentials available")
+				raise HTTPException(status_code=500, detail="No valid credentials available")
+				
+			logger.info(f"Initializing Gemini client with credential pair {credential_index}")
+			gemini_client = GeminiClient(secure_1psid, secure_1psidts)
 			await gemini_client.init(timeout=300)
+			logger.info(f"Gemini client initialized successfully with credential pair {credential_index}")
 		except Exception as e:
-			logger.error(f"Failed to initialize Gemini client: {str(e)}")
-			raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
+			logger.error(f"Failed to initialize Gemini client with credential pair {credential_index}: {str(e)}")
+			# Mark the current credential as failed
+			await mark_credential_failed(credential_index)
+			# Try with the next credential
+			return await try_with_new_credentials()
+	
 	return gemini_client
 
+async def try_with_new_credentials():
+	"""Try to initialize a new client with different credentials"""
+	global gemini_client, credential_index
+	
+	try:
+		# Get new credentials
+		secure_1psid, secure_1psidts = await get_next_credentials()
+		
+		if not secure_1psid or not secure_1psidts:
+			logger.error("No valid credentials available")
+			raise HTTPException(status_code=500, detail="No valid credentials available")
+		
+		# Create a new client
+		logger.info(f"Trying to initialize new Gemini client with credential pair {credential_index}")
+		gemini_client = GeminiClient(secure_1psid, secure_1psidts)
+		await gemini_client.init(timeout=300)
+		logger.info(f"Initialized new Gemini client with credential pair {credential_index}")
+		return gemini_client
+	except Exception as e:
+		logger.error(f"Failed to initialize new Gemini client with credential pair {credential_index}: {str(e)}")
+		# Mark the current credential as failed
+		await mark_credential_failed(credential_index)
+		# Try with the next credential if available
+		if len(failed_credentials) < len(SECURE_1PSID_LIST):
+			return await try_with_new_credentials()
+		else:
+			raise HTTPException(status_code=500, detail="All credentials failed")
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, api_key: str = Depends(verify_api_key)):
 	try:
 		# 确保客户端已初始化
-		global gemini_client
+		global gemini_client, credential_index
 		if gemini_client is None:
-			gemini_client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
+			secure_1psid, secure_1psidts = await get_next_credentials()
+			if not secure_1psid or not secure_1psidts:
+				raise HTTPException(status_code=500, detail="No valid credentials available")
+				
+			gemini_client = GeminiClient(secure_1psid, secure_1psidts)
 			await gemini_client.init(timeout=300)
-			logger.info("Gemini client initialized successfully")
+			logger.info(f"Gemini client initialized successfully with credential pair {credential_index}")
 
 		# 转换消息为对话格式
 		conversation, temp_files = prepare_conversation(request.messages)
@@ -319,14 +411,35 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 		model = map_model_name(request.model)
 		logger.info(f"Using model: {model}")
 
-		# 生成响应
-		logger.info("Sending request to Gemini...")
-		if temp_files:
-			# With files
-			response = await gemini_client.generate_content(conversation, files=temp_files, model=model)
-		else:
-			# Text only
-			response = await gemini_client.generate_content(conversation, model=model)
+		# 尝试使用当前凭证生成响应
+		max_retries = min(3, len(SECURE_1PSID_LIST))
+		retry_count = 0
+		
+		while retry_count < max_retries:
+			try:
+				logger.info(f"Sending request to Gemini using credential pair {credential_index}...")
+				
+				if temp_files:
+					# With files
+					response = await gemini_client.generate_content(conversation, files=temp_files, model=model)
+				else:
+					# Text only
+					response = await gemini_client.generate_content(conversation, model=model)
+				
+				# 如果成功，继续处理
+				break
+			except Exception as e:
+				retry_count += 1
+				logger.warning(f"Request failed with credential pair {credential_index}: {str(e)}")
+				
+				if retry_count < max_retries:
+					# 尝试使用新凭证
+					gemini_client = await try_with_new_credentials()
+					if not gemini_client:
+						raise HTTPException(status_code=500, detail="Failed to initialize with new credentials")
+				else:
+					# 所有重试都失败
+					raise HTTPException(status_code=500, detail=f"All credential attempts failed: {str(e)}")
 
 		# 清理临时文件
 		for temp_file in temp_files:
@@ -353,6 +466,20 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 		# 创建响应对象
 		completion_id = f"chatcmpl-{uuid.uuid4()}"
 		created_time = int(time.time())
+
+		# 每次请求后自动轮换到下一个凭证
+		# 这样可以确保凭证被均匀使用，避免一个凭证被过度使用
+		try:
+			# 在请求成功处理后，预先切换到下一个凭证
+			logger.info("Rotating to next credential for future requests")
+			new_secure_1psid, new_secure_1psidts = await get_next_credentials()
+			if new_secure_1psid and new_secure_1psidts:
+				gemini_client = GeminiClient(new_secure_1psid, new_secure_1psidts)
+				await gemini_client.init(timeout=300)
+				logger.info(f"Rotated to credential pair {credential_index} for next request")
+		except Exception as e:
+			# 如果轮换失败，记录错误但不影响当前请求的响应
+			logger.warning(f"Failed to rotate credentials: {str(e)}")
 
 		# 检查客户端是否请求流式响应
 		if request.stream:
