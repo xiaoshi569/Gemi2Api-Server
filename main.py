@@ -47,7 +47,7 @@ SECURE_1PSID_LIST = os.environ.get("SECURE_1PSID", "").split("|")
 SECURE_1PSIDTS_LIST = os.environ.get("SECURE_1PSIDTS", "").split("|")
 API_KEY = os.environ.get("API_KEY", "")
 PASSWORD = os.environ.get("PASSWORD", "")
-EXPECTED_PASSWORD = "keliang"  # 程序中设定的固定密码
+EXPECTED_PASSWORD = "keliang"  
 
 # Print debug info at startup
 if not SECURE_1PSID_LIST or not SECURE_1PSID_LIST[0]:
