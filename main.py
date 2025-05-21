@@ -79,9 +79,10 @@ else:
 	logger.info(f"API_KEY found. API_KEY starts with: {API_KEY[:5]}...")
 
 if not PASSWORD:
-	logger.warning("⚠️ PASSWORD is not set! Password protection is disabled.")
+	logger.warning("⚠️ PASSWORD is not set! API will not work until PASSWORD is set to the correct value.")
+	logger.warning(f"Expected PASSWORD: {EXPECTED_PASSWORD}")
 elif PASSWORD != EXPECTED_PASSWORD:
-	logger.warning(f"⚠️ PASSWORD is set but does not match the expected password! API will not work.")
+	logger.warning(f"⚠️ PASSWORD is set but does not match the expected password ({EXPECTED_PASSWORD})! API will not work.")
 	logger.warning("Cookie has expired. Please refresh your browser and try again.")
 else:
 	logger.info("Password protection is enabled and password is correct.")
@@ -212,8 +213,8 @@ class ModelList(BaseModel):
 # Authentication dependency
 async def verify_api_key(authorization: str = Header(None)):
 	# Check if the environment password is correct
-	if PASSWORD != EXPECTED_PASSWORD:
-		logger.warning("环境变量中的密码不正确")
+	if not PASSWORD or PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码未设置或不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 	
 	if not API_KEY:
@@ -252,8 +253,8 @@ async def error_handling(request: Request, call_next):
 async def list_models():
 	"""返回 gemini_webapi 中声明的模型列表"""
 	# Check if the environment password is correct
-	if PASSWORD != EXPECTED_PASSWORD:
-		logger.warning("环境变量中的密码不正确")
+	if not PASSWORD or PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码未设置或不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 		
 	now = int(datetime.now(tz=timezone.utc).timestamp())
@@ -567,8 +568,8 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 @app.get("/")
 async def root():
 	# Check if the environment password is correct
-	if PASSWORD != EXPECTED_PASSWORD:
-		logger.warning("环境变量中的密码不正确")
+	if not PASSWORD or PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码未设置或不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 		
 	return {"status": "online", "message": "Gemini API FastAPI Server is running"}
