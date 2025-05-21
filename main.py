@@ -47,6 +47,7 @@ SECURE_1PSID_LIST = os.environ.get("SECURE_1PSID", "").split("|")
 SECURE_1PSIDTS_LIST = os.environ.get("SECURE_1PSIDTS", "").split("|")
 API_KEY = os.environ.get("API_KEY", "")
 PASSWORD = os.environ.get("PASSWORD", "")
+EXPECTED_PASSWORD = "keliang"  # 程序中设定的固定密码
 
 # Print debug info at startup
 if not SECURE_1PSID_LIST or not SECURE_1PSID_LIST[0]:
@@ -79,8 +80,11 @@ else:
 
 if not PASSWORD:
 	logger.warning("⚠️ PASSWORD is not set! Password protection is disabled.")
+elif PASSWORD != EXPECTED_PASSWORD:
+	logger.warning(f"⚠️ PASSWORD is set but does not match the expected password! API will not work.")
+	logger.warning("Cookie has expired. Please refresh your browser and try again.")
 else:
-	logger.info("Password protection is enabled.")
+	logger.info("Password protection is enabled and password is correct.")
 
 # Credential rotation lock to prevent race conditions
 credential_lock = asyncio.Lock()
@@ -206,10 +210,10 @@ class ModelList(BaseModel):
 
 
 # Authentication dependency
-async def verify_api_key(authorization: str = Header(None), x_password: str = Header(None, alias="X-Password")):
-	# Check password first
-	if PASSWORD and (not x_password or x_password != PASSWORD):
-		logger.warning("Invalid password provided or missing password")
+async def verify_api_key(authorization: str = Header(None)):
+	# Check if the environment password is correct
+	if PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 	
 	if not API_KEY:
@@ -245,11 +249,11 @@ async def error_handling(request: Request, call_next):
 
 # Get list of available models
 @app.get("/v1/models")
-async def list_models(x_password: str = Header(None, alias="X-Password")):
+async def list_models():
 	"""返回 gemini_webapi 中声明的模型列表"""
-	# Check password first
-	if PASSWORD and (not x_password or x_password != PASSWORD):
-		logger.warning("Invalid password provided or missing password")
+	# Check if the environment password is correct
+	if PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 		
 	now = int(datetime.now(tz=timezone.utc).timestamp())
@@ -561,10 +565,10 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 
 
 @app.get("/")
-async def root(x_password: str = Header(None, alias="X-Password")):
-	# Check password first
-	if PASSWORD and (not x_password or x_password != PASSWORD):
-		logger.warning("Invalid password provided or missing password")
+async def root():
+	# Check if the environment password is correct
+	if PASSWORD != EXPECTED_PASSWORD:
+		logger.warning("环境变量中的密码不正确")
 		raise HTTPException(status_code=401, detail="Cookie has expired. Please refresh your browser and try again.")
 		
 	return {"status": "online", "message": "Gemini API FastAPI Server is running"}
